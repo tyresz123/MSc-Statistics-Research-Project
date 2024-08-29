@@ -1,0 +1,571 @@
+---
+title: "Gaussian Graphical Model"
+subtitle: ""
+author: ""
+date: ""
+output:
+  html_document:
+    fig_caption: yes
+    number_sections: yes
+    self_contained: yes
+    theme: flatly
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      eval = TRUE,
+                      message = FALSE, 
+                      warning = FALSE,
+                      comment = NA,
+                      cache = TRUE)
+```
+
+# Load Packages
+
+```{r}
+library(tidyverse)
+library(glasso)
+library(cvTools)
+library(recipes)
+library(bestNormalize)
+library(furrr)
+library(mvtnorm)
+library(igraph)
+library(changepoint)
+theme_set(theme_bw())
+```
+
+# Import Data
+
+```{r}
+data = read_csv('data.csv')
+```
+
+# AIC & BIC
+
+```{r}
+all_preprocessor = recipe(~., data = data) |> 
+    step_select(-Date) |> 
+    step_best_normalize(all_numeric_predictors()) |> 
+    step_normalize(all_numeric_predictors())
+
+scale_all_data = bake(prep(all_preprocessor), new_data = data)
+scale_sigma = cov(scale_all_data)
+```
+
+```{r}
+ic_tune = function(rho, s, nobs){
+  
+  graphical_lasso = glasso(s = s,
+                           rho = rho,
+                           penalize.diagonal = FALSE,
+                           nobs = nobs)
+  
+  p = ncol(scale_sigma)
+  aic = -2 / nobs * sum(graphical_lasso$loglik) + 2 * (p + p^2) / nobs
+  bic = -2 * sum(graphical_lasso$loglik) + log(nobs) * (p + p^2)
+  
+  return(tibble(rho = rho, 
+                aic = aic,
+                bic = bic))
+  
+}
+```
+
+```{r}
+set.seed(1)
+rho_seq = seq(0,1,0.001)
+plan(multisession, workers = parallel::detectCores())
+ic_result = future_map(.x = rho_seq,
+                       .f = ic_tune,
+                       s = scale_sigma,
+                       nobs = nrow(data),
+                       .progress = TRUE)
+ic_result = list_rbind(ic_result)
+```
+
+```{r}
+ggplot(data = ic_result,
+       mapping = aes(x = rho, y = aic)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = 'AIC')
+```
+
+```{r}
+ggplot(data = ic_result,
+       mapping = aes(x = rho, y = bic)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = 'BIC')
+```
+
+# Tune Parameter for Graphical Lasso
+
+Create folds.
+
+```{r}
+K = 10
+set.seed(1)
+folds = cvFolds(n = nrow(data), K = K)
+```
+
+Generate scaled data for each fold.
+
+```{r}
+scale_data = function(k, folds, data){
+  
+  id_test = folds$subsets[folds$which==k]
+  
+  train_data = data |> slice(-id_test) |> select(-Date)
+  test_data = data |> slice(id_test) |> select(-Date)
+  
+  preprocessor = recipe(~., data = train_data) |> 
+    step_best_normalize(all_numeric_predictors()) |> 
+    step_normalize(all_numeric_predictors())
+  
+  result = list(scale_train = bake(prep(preprocessor),new_data = train_data),
+                scale_test = bake(prep(preprocessor),new_data = test_data))
+  
+  return(result)
+  
+}
+```
+
+```{r}
+set.seed(1)
+plan(multisession, workers = parallel::detectCores())
+scale_data_list = future_map(.x = 1:K,
+                             .f = scale_data,
+                             folds = folds,
+                             data = data,
+                             .progress = TRUE)
+```
+
+```{r}
+scale_train_data = map(.x = scale_data_list,
+                       .f = ~.x$scale_train)
+```
+
+```{r}
+scale_test_data = map(.x = scale_data_list,
+                      .f = ~.x$scale_test)
+```
+
+Find optimal $\rho$ for graphical lasso.
+
+```{r}
+lasso_tune = function(rho, train_data_list, test_data_list){
+  
+  K = length(train_data_list)
+  log_likelihood = rep(NA, K)
+  aic = rep(NA, K)
+  bic = rep(NA, K)
+  metric1 = rep(NA, K)
+  metric2 = rep(NA, K)
+  metric3 = rep(NA, K)
+  loss = rep(NA, K)
+  num_edges = rep(NA, K)
+  
+  for(k in 1:K){
+    
+    s = cov(train_data_list[[k]])
+    p = ncol(s)
+    nobs = nrow(test_data_list[[k]])
+    graphical_lasso = glasso(s = s, 
+                             rho = rho,
+                             penalize.diagonal = FALSE)
+    sigma = graphical_lasso$w
+    
+    log_density = dmvnorm(x = test_data_list[[k]],
+                          mean = rep(0,p),
+                          sigma = sigma,
+                          log = TRUE)
+    
+    log_density_raw = dmvnorm(x = test_data_list[[k]],
+                              mean = rep(0,p),
+                              sigma = s,
+                              log = TRUE)
+    
+    log_likelihood[k] = sum(log_density)
+    aic[k] = -2 / nobs * sum(log_density) + 2 * (p + p^2) / nobs
+    bic[k] = -2 * sum(log_density) + log(nobs) * (p + p^2)
+    loss[k] = sum(log_density_raw) - sum(log_density)
+    inv_cov = graphical_lasso$wi
+    diag(inv_cov) = 0
+    num_edge = sum(inv_cov!=0)/2
+    num_edges[k] = num_edge
+    
+    metric1[k] = mean(log_density) / (num_edge + 1)
+    metric2[k] = mean(log_density) / sqrt(num_edge + 1)
+    metric3[k] = mean(log_density) / ((num_edge + 1)^2)
+    
+  }
+  
+  avg_log_likelihood = mean(log_likelihood)
+  avg_aic = mean(aic)
+  avg_bic = mean(bic)
+  avg_loss = mean(loss)
+  avg_metric1 = mean(metric1)
+  avg_metric2 = mean(metric2)
+  avg_metric3 = mean(metric3)
+  avg_edge = mean(num_edges)
+  
+  return(tibble(log_likelihood = avg_log_likelihood, 
+                aic = avg_aic,
+                bic = avg_bic,
+                loss = avg_loss,
+                metric_raw = avg_metric1,
+                metric_sqrt = avg_metric2,
+                metric_square = avg_metric3,
+                num_edges = avg_edge))
+  
+}
+```
+
+```{r}
+set.seed(1)
+plan(multisession, workers = parallel::detectCores())
+cv_tune = future_map(.x = rho_seq,
+                     .f = lasso_tune,
+                     train_data_list = scale_train_data,
+                     test_data_list = scale_test_data,
+                     .progress = TRUE)
+cv_tune = list_rbind(cv_tune)
+```
+
+```{r}
+tune_result = cv_tune |> mutate(rho = rho_seq)
+optim_rho = tune_result |> slice_max(order_by = metric_square)
+optim_rho
+```
+
+## Log-Likelihood
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = log_likelihood)) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = log_likelihood),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Log-Likelihood')
+```
+
+## Edges
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = num_edges)) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = num_edges),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Number of Edges (raw)')
+```
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = sqrt(num_edges))) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = sqrt(num_edges)),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Number of Edges (sqrt)')
+```
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = num_edges^2)) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = num_edges^2),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Number of Edges (square)')
+```
+
+```{r}
+tune_result |> 
+  select(log_likelihood,starts_with('metric_')) |> 
+  pivot_longer(cols = -log_likelihood) |> 
+  group_by(name) |> 
+  summarise(correlation = cor(x = value, y = log_likelihood, method = 'pearson')) |> 
+  ungroup()
+```
+
+## Loss
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = loss)) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = loss),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Loss')
+```
+
+## AIC
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = aic)) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = aic),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-AIC')
+```
+
+## BIC
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = bic)) +
+  geom_line() +
+  geom_vline(xintercept = optim_rho$rho,
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = optim_rho,
+             mapping = aes(x = rho, y = bic),
+             color = 'red',
+             size = 5) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-BIC')
+```
+
+## Metric (Raw)
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = metric_raw)) +
+  geom_line() +
+  geom_vline(xintercept = tune_result$rho[which.max(tune_result$metric_raw)],
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = tune_result |> slice_max(order_by = metric_raw),
+             mapping = aes(x = rho, y = metric_raw),
+             color = 'red',
+             size = 5) +
+  geom_vline(xintercept = 0.7,
+             color = 'blue',
+             linetype = 'dashed') +
+  ylim(c(-10,0)) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Metric (Raw)')
+```
+
+```{r}
+metric_raw_slope = tune_result |> 
+  select(metric_raw,rho) |> 
+  mutate(slope1 = c(NA,diff(metric_raw)) / c(NA,diff(rho)),
+         slope2 = c(NA,diff(slope1)) / c(NA,diff(rho)))
+```
+
+```{r}
+metric_raw_slope |>
+  filter(between(rho,0.05,0.8)) |> 
+  ggplot(aes(x = rho, y = slope1)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = '1-st Derivation of Metric (Raw)')
+```
+
+```{r}
+metric_raw_slope |> 
+  filter(between(rho,0.05,0.8)) |> 
+  ggplot(aes(x = rho, y = slope2)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = '2-nd Derivation of Metric (Raw)')
+```
+
+```{r}
+metric_raw_slope |> 
+  filter(slope1>0) |> 
+  slice_max(order_by = rho,n = 5)
+```
+
+## Metric (Sqrt)
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = metric_sqrt)) +
+  geom_line() +
+  geom_vline(xintercept = tune_result$rho[which.max(tune_result$metric_sqrt)],
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = tune_result |> slice_max(order_by = metric_sqrt),
+             mapping = aes(x = rho, y = metric_sqrt),
+             color = 'red',
+             size = 5) +
+  geom_vline(xintercept = 0.7,
+             color = 'blue',
+             linetype = 'dashed') +
+  ylim(c(-10,0)) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Metric (Sqrt)')
+```
+
+```{r}
+metric_sqrt_slope = tune_result |> 
+  select(metric_sqrt,rho) |> 
+  mutate(slope1 = c(NA,diff(metric_sqrt)) / c(NA,diff(rho)),
+         slope2 = c(NA,diff(slope1)) / c(NA,diff(rho)))
+```
+
+```{r}
+metric_sqrt_slope |> 
+  filter(between(rho,0.05,0.8)) |> 
+  ggplot(aes(x = rho, y = slope1)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = '1-st Derivation of Metric (Sqrt)')
+```
+
+```{r}
+metric_sqrt_slope |> 
+  filter(between(rho,0.05,0.8)) |> 
+  ggplot(aes(x = rho, y = slope2)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = '2-nd Derivation of Metric (Sqrt)')
+```
+
+```{r}
+metric_sqrt_slope |> 
+  filter(slope1>0) |> 
+  slice_max(order_by = rho,n = 5)
+```
+
+## Metric (Square)
+
+```{r}
+ggplot(data = tune_result,
+       mapping = aes(x = rho, y = metric_square)) +
+  geom_line() +
+  geom_vline(xintercept = tune_result$rho[which.max(tune_result$metric_square)],
+             color = 'red',
+             linetype = 'dashed') +
+  geom_point(data = tune_result |> slice_max(order_by = metric_square),
+             mapping = aes(x = rho, y = metric_square),
+             color = 'red',
+             size = 5) +
+  geom_vline(xintercept = 0.604,
+             color = 'blue',
+             linetype = 'dashed') +
+  ylim(c(-0.3,0)) +
+  labs(x = 'Regularization Parameter',
+       y = 'CV-Metric (Square)')
+```
+
+```{r}
+metric_square_slope = tune_result |> 
+  select(metric_square,rho) |> 
+  mutate(slope1 = c(NA,diff(metric_square)) / c(NA,diff(rho)),
+         slope2 = c(NA,diff(slope1)) / c(NA,diff(rho)))
+```
+
+```{r}
+metric_square_slope |> 
+  filter(between(rho,0.05,0.8)) |> 
+  ggplot(aes(x = rho, y = slope1)) +
+  geom_line() +
+  geom_hline(yintercept = -0.374, color = 'red') +
+  geom_point(data = data.frame(rho = 0.683, slope1 = -0.374),
+             mapping = aes(x = rho, y = slope1),
+             color = 'blue',
+             size = 3) +
+  labs(x = 'Regularization Parameter',
+       y = '1-st Derivation of Metric (Square)')
+```
+
+```{r}
+metric_square_slope |> 
+  filter(between(rho,0.05,0.8)) |> 
+  ggplot(aes(x = rho, y = slope2)) +
+  geom_line() +
+  labs(x = 'Regularization Parameter',
+       y = '2-nd Derivation of Metric (Square)')
+```
+
+```{r}
+metric_square_slope |> 
+  filter(slope1>0) |> 
+  slice_max(order_by = rho,n = 5)
+```
+
+# Change Point
+
+```{r}
+# Change Point
+slope2 = metric_square_slope |> 
+  filter(between(rho,0.05,0.8)) |> 
+  select(rho,slope2)
+
+result = cpt.var(data = slope2$slope2, penalty = 'MBIC', method = 'BinSeg', Q = 1)
+
+optim_rho = slope2$rho[cpts(result)]
+optim_rho
+```
+
+# Network
+
+```{r fig.height=10, fig.width=10}
+final_glasso = glasso(s = scale_sigma, rho = optim_rho)
+adjacency_matrix = final_glasso$wi
+diag(adjacency_matrix) = 0
+adjacency_matrix[lower.tri(adjacency_matrix)] = t(adjacency_matrix)[lower.tri(adjacency_matrix)]
+
+graph = graph.adjacency(abs(adjacency_matrix), 
+                        mode = "undirected", 
+                        weighted = TRUE)
+V(graph)$name = colnames(scale_sigma)
+V(graph)$label = V(graph)$name
+deg = degree(graph, mode = "all")
+V(graph)$size = log(deg + 2) * 8
+E(graph)$width = E(graph)$weight * 80
+
+set.seed(1)
+plot(graph, 
+     layout = layout_with_graphopt, 
+     vertex.color = "lightblue",
+     edge.color = "grey",
+     edge.label.cex = 0.8)
+```
+
+
+
